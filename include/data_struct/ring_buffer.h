@@ -31,7 +31,9 @@ namespace ezio {
 #if __cplusplus < 201703L
         struct aligned_deleter {
             void operator()(void* ptr) const {
-                std::free(ptr);
+                if (ptr != nullptr) {
+                    std::free(ptr);
+                }
             }
         };
 #endif

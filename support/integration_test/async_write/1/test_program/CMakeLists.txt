@@ -1,7 +1,7 @@
 CMAKE_MINIMUM_REQUIRED(VERSION 2.8)
 PROJECT(test_program)
 unset(ASAN_SWITCH CACHE)
-OPTION(ASAN_SWITCH   "use asan tool"  ON)
+OPTION(ASAN_SWITCH   "use asan tool"  OFF)
 
 SET(CMAKE_CXX_COMPILER "g++")
 SET(CMAKE_CXX_FLAGS_DEBUG "$ENV{CXXFLAGS} -O0 -Wall -g -ggdb")
@@ -27,6 +27,5 @@ ADD_EXECUTABLE(test_program ${SOURCE_FILES})
 TARGET_LINK_LIBRARIES(test_program
 -lpthread
 dl
-uring
 #asan
 )

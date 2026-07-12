@@ -27,5 +27,4 @@ ADD_EXECUTABLE(test_program ${SOURCE_FILES})
 TARGET_LINK_LIBRARIES(test_program
 -lpthread
 dl
-uring
 )

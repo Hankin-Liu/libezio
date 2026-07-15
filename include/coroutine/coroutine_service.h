@@ -24,6 +24,9 @@
 #include "../type_def.h"
 
 #include <memory>
+#include <list>
+#include <vector>
+#include <atomic>
 
 namespace ezio {
 namespace coroutine {
@@ -245,6 +248,95 @@ public:
     }
 
     // ========================================================================
+    // Spawn: fire-and-forget coroutine lifecycle managed by this service
+    // ========================================================================
+
+    /**
+     * @brief Spawn a fire-and-forget coroutine.
+     *
+     * The spawned task is automatically start()ed and tracked by this service.
+     * On completion, the task's final_suspend callback pushes its
+     * std::list iterator into an internal dead-queue. Deferred cleanup is
+     * batched: only the first completion after a cleanup triggers a single
+     * evt loop job post; subsequent completions before cleanup runs only
+     * append to the pending queue. This avoids N posts for N completions.
+     *
+     * Safety: the on_final_resume_ callback only pushes an iterator into a
+     * vector — it never touches the coroutine frame itself. The frame stays
+     * alive because final_suspend returns suspend_always. The actual erase
+     * (which triggers task destructor and coroutine frame destruction) happens
+     * later in sweep_completed(), which is safe because by then the callback
+     * has already returned and the frame is fully quiescent.
+     *
+     * Usage:
+     *   coro_svc.spawn(echo_loop(coro_svc, fd));
+     *   // no manual start(), no manual vector management
+     */
+    void spawn(task<void> t) {
+        if (t.done()) {
+            return;
+        }
+
+        // Insert into tracking list
+        spawned_list_.push_front(std::move(t));
+        auto it = spawned_list_.begin();
+
+        // Register final_suspend callback: push iterator to pending queue
+        // and lazily schedule a single cleanup job on the evt loop.
+        auto& promise = it->get_promise();
+        promise.on_final_resume_ = [this, iter = it]() {
+            pending_cleanup_.push_back(iter);
+            // Only the first completion after last drain triggers a post.
+            // All completions happen on the same evt loop thread, so
+            // a plain bool is sufficient — no atomics needed.
+            if (!cleanup_posted_) {
+                cleanup_posted_ = true;
+                svc_->run_job([this]() {
+                    this->sweep_completed();
+                    // All done — allow next batch
+                    cleanup_posted_ = false;
+                });
+            }
+        };
+
+        it->start();
+    }
+
+private:
+    /**
+     * @brief Drain pending queue and erase completed tasks from active list.
+     *
+     * Called from a evt loop job that was registered by the first
+     * completion after the last drain.
+     */
+    void sweep_completed() {
+        for (auto& iter : pending_cleanup_) {
+            spawned_list_.erase(iter);
+        }
+        pending_cleanup_.clear();
+    }
+
+public:
+    /**
+     * @brief Cancel all spawned tasks immediately.
+     */
+    void clear_spawned() {
+        spawned_list_.clear();
+        pending_cleanup_.clear();
+        cleanup_posted_ = false;
+    }
+
+    /**
+     * @brief Number of currently active spawned tasks.
+     *
+     * Note: includes completed-but-not-yet-swept tasks.
+     * Use sweep() first for accurate count.
+     */
+    size_t spawned_count() const {
+        return spawned_list_.size();
+    }
+
+    // ========================================================================
     // Underlying service access
     // ========================================================================
 
@@ -252,6 +344,9 @@ public:
 
 private:
     event::event_service* svc_{ nullptr };
+    std::list<task<void>> spawned_list_;
+    std::vector<std::list<task<void>>::iterator> pending_cleanup_;
+    bool cleanup_posted_{ false };
 };
 
 // ============================================================================

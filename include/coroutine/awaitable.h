@@ -219,6 +219,14 @@ struct task_promise_base {
     std::coroutine_handle<> continuation_{ nullptr };
     std::exception_ptr exception_{ nullptr };
 
+    /// Optional: called in final_suspend before resuming continuation.
+    /// Used by coroutine_service::spawn to auto-enqueue this task's
+    /// iterator into a dead-queue for lazy cleanup.
+    /// Safe to call here: the coroutine frame is still alive (we return
+    /// suspend_always and the compiler does not destroy it until the
+    /// task destructor calls handle_.destroy()).
+    std::function<void()> on_final_resume_{ nullptr };
+
     std::suspend_always initial_suspend() noexcept { return {}; }
 
     struct final_awaiter {
@@ -226,8 +234,21 @@ struct task_promise_base {
 
         template<typename Promise>
         void await_suspend(std::coroutine_handle<Promise> h) noexcept {
-            if (h.promise().continuation_) {
-                h.promise().continuation_.resume();
+            // Resume continuation first (if any).
+            // Then fire the cleanup callback as the very last thing.
+            // Order matters: the callback may have side effects that
+            // assume the continuation has already been notified.
+            auto& promise = h.promise();
+            auto continuation = promise.continuation_;
+            auto cleanup = std::move(promise.on_final_resume_);
+
+            if (continuation) {
+                continuation.resume();
+            }
+            // Now callback truly is the last thing that touches this frame.
+            // After this returns, the coroutine is fully quiescent.
+            if (cleanup) {
+                cleanup();
             }
         }
 
@@ -298,6 +319,13 @@ public:
         }
     }
 
+    bool done() const {
+        return !handle_ || handle_.done();
+    }
+
+    /// Access the promise (for coroutine_service internal use)
+    promise_type& get_promise() { return handle_.promise(); }
+
 private:
     handle_type handle_{ nullptr };
 };
@@ -351,6 +379,13 @@ public:
             handle_.resume();
         }
     }
+
+    bool done() const {
+        return !handle_ || handle_.done();
+    }
+
+    /// Access the promise (for coroutine_service internal use)
+    promise_type& get_promise() { return handle_.promise(); }
 
 private:
     handle_type handle_{ nullptr };

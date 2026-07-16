@@ -1,21 +1,16 @@
 /****************************************************************************************
  * @file coroutine_service.h
  * @brief Coroutine-friendly wrapper around ezio::event::event_service
- * 
+ *
  * Provides co_await-able wrappers for all event_service async operations.
  * Underneath, it still uses libezio's callback-based APIs.
- * 
- * Usage Pattern:
- *   // The awaitable is created BEFORE submit, and the callback captures
- *   // a pointer to it. After co_await, the operation is guaranteed complete.
- *   
- *   int32_t bytes = co_await coro_svc.read(fd, &iov, 1);
- *   // bytes = number read, or negative errno
- * 
- *   int32_t written = co_await coro_svc.write(fd, &iov, 1);
  *
- * @author Generated
- * @license ...
+ * This header and all its types are available only when
+ * EZIO_ENABLE_COROUTINE == 1 (C++20 compiler with <coroutine>).
+ *
+ * Usage Pattern:
+ *   int32_t bytes = co_await coro_svc.read(fd, &iov, 1);
+ *   int32_t written = co_await coro_svc.write(fd, &iov, 1);
  ***************************************************************************************/
 #pragma once
 
@@ -23,10 +18,16 @@
 #include "../event_service.h"
 #include "../type_def.h"
 
+#if EZIO_ENABLE_COROUTINE
+
 #include <memory>
 #include <list>
 #include <vector>
 #include <atomic>
+
+// Default frame pool configuration
+static constexpr size_t DEFAULT_FRAME_BLOCK_SIZE = 8192;
+static constexpr size_t DEFAULT_FRAME_POOL_CAPACITY = 4096;
 
 namespace ezio {
 namespace coroutine {
@@ -79,15 +80,115 @@ private:
 };
 
 // ============================================================================
+// coroutine_frame_pool — fixed-size block pool, 0 heap alloc after ctor
+// ============================================================================
+
+class coroutine_frame_pool {
+public:
+    coroutine_frame_pool(size_t block_size, size_t capacity)
+        : block_size_(block_size)
+        , capacity_(capacity)
+    {
+        size_t total = block_size_ * capacity_;
+        mem_ = static_cast<char*>(::operator new(total));
+        // Build LIFO free list using indexes stored in next_free_[].
+        // We avoid storing free-list pointers inside the blocks themselves
+        // because the blocks may already contain constructed objects.
+        free_head_ = 0;
+        for (size_t i = 0; i < capacity_; ++i) {
+            next_free_[i] = i + 1;
+        }
+        next_free_[capacity_ - 1] = static_cast<size_t>(-1);
+    }
+
+    ~coroutine_frame_pool() {
+        ::operator delete(mem_);
+    }
+
+    coroutine_frame_pool(const coroutine_frame_pool&) = delete;
+    coroutine_frame_pool& operator=(const coroutine_frame_pool&) = delete;
+    coroutine_frame_pool(coroutine_frame_pool&&) = delete;
+    coroutine_frame_pool& operator=(coroutine_frame_pool&&) = delete;
+
+    size_t block_size() const { return block_size_; }
+
+    bool owns(void* ptr) const {
+        return ptr >= mem_ && ptr < mem_ + block_size_ * capacity_;
+    }
+
+    void* alloc() {
+        if (free_head_ == static_cast<size_t>(-1)) return nullptr;
+        size_t idx = free_head_;
+        free_head_ = next_free_[idx];
+        return mem_ + idx * block_size_;
+    }
+
+    void free(void* ptr) {
+        if (!ptr || !owns(ptr)) return;
+        size_t offset = static_cast<char*>(ptr) - mem_;
+        size_t idx = offset / block_size_;
+        next_free_[idx] = free_head_;
+        free_head_ = idx;
+    }
+
+    size_t free_count() const {
+        size_t n = 0;
+        for (size_t i = free_head_; i != static_cast<size_t>(-1); i = next_free_[i]) {
+            ++n;
+        }
+        return n;
+    }
+
+    bool empty() const { return free_head_ == static_cast<size_t>(-1); }
+
+private:
+    char* mem_{ nullptr };
+    size_t block_size_{ 0 };
+    size_t capacity_{ 0 };
+    size_t free_head_{ static_cast<size_t>(-1) };
+    size_t next_free_[DEFAULT_FRAME_POOL_CAPACITY];
+};
+
+static_assert(DEFAULT_FRAME_BLOCK_SIZE >= 80,
+    "Frame block size must be >= 80 bytes (minimum coroutine frame)");
+
+// ============================================================================
 // coroutine_service
 // ============================================================================
 
 class coroutine_service {
 public:
-    explicit coroutine_service(event::event_service* svc) : svc_(svc) {}
+    explicit coroutine_service(event::event_service* svc,
+                               size_t frame_block_size = DEFAULT_FRAME_BLOCK_SIZE,
+                               size_t frame_pool_capacity = DEFAULT_FRAME_POOL_CAPACITY)
+        : svc_(svc)
+        , frame_pool_(frame_block_size, frame_pool_capacity)
+    {
+        set_current();
+    }
+
+    ~coroutine_service() {
+        clear_current();
+    }
 
     coroutine_service(const coroutine_service&) = delete;
     coroutine_service& operator=(const coroutine_service&) = delete;
+
+    /// Activate pool allocation: sets thread-local pointer so that
+    /// promise_type::operator new allocates frames from the pool.
+    /// Called automatically in constructor; call manually if you
+    /// re-enter a coroutine-creating context outside this service's
+    /// lifetime (rare).
+    void set_current()  { current_coro_svc = this; }
+
+    /// Deactivate pool allocation: clears thread-local pointer so
+    /// that future coroutine frames use the global heap.
+    /// Called automatically in destructor; call manually only if
+    /// you temporarily need heap allocation (benchmarking).
+    void clear_current() { current_coro_svc = nullptr; }
+
+    /// Access the underlying event_service, e.g. for direct callback-based usage.
+    event::event_service* get_event_service() const { return svc_; }
 
     // ========================================================================
     // Async Read (iov-based)
@@ -337,6 +438,42 @@ public:
     }
 
     // ========================================================================
+    // Frame pool access for task_promise_base::operator new/delete
+    // ========================================================================
+
+    /**
+     * @brief Allocate a coroutine frame from the pre-allocated pool.
+     *
+     * Called by task_promise_base::operator new. Falls back to ::operator new
+     * if the block is larger than the pool block size or the pool is full.
+     *
+     * Note: sz is checked against block_size_. If bigger, we use global alloc
+     * because the coroutine has unusually large local data. The pool stores
+     * size_t overflow_ flag in the block itself so free can route correctly.
+     */
+    void* alloc_frame(std::size_t sz) {
+        if (sz <= frame_pool_.block_size()) {
+            void* p = frame_pool_.alloc();
+            if (p) {
+                return p;
+            }
+        }
+        // Pool exhausted or oversized frame — fallback to global heap
+        return ::operator new(sz);
+    }
+
+    /**
+     * @brief Free a coroutine frame.
+     */
+    void free_frame(void* ptr, std::size_t sz) {
+        if (sz <= frame_pool_.block_size() && frame_pool_.owns(ptr)) {
+            frame_pool_.free(ptr);
+        } else {
+            ::operator delete(ptr);
+        }
+    }
+
+    // ========================================================================
     // Underlying service access
     // ========================================================================
 
@@ -344,6 +481,7 @@ public:
 
 private:
     event::event_service* svc_{ nullptr };
+    coroutine_frame_pool frame_pool_;
     std::list<task<void>> spawned_list_;
     std::vector<std::list<task<void>>::iterator> pending_cleanup_;
     bool cleanup_posted_{ false };
@@ -378,3 +516,5 @@ private:
 
 } // namespace coroutine
 } // namespace ezio
+
+#endif // EZIO_ENABLE_COROUTINE

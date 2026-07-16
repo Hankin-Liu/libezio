@@ -31,3 +31,12 @@
 #else
 #error "unknow poller"
 #endif
+
+// ============================================================================
+// C++20 coroutine support flag
+// ============================================================================
+// Set by CMake via compile_definition when <coroutine> is available.
+// For non-CMake builds, default to 0 (no coroutine support).
+#ifndef EZIO_ENABLE_COROUTINE
+#define EZIO_ENABLE_COROUTINE 0
+#endif

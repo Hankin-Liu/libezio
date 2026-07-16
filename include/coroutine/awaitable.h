@@ -15,6 +15,18 @@
  ***************************************************************************************/
 #pragma once
 
+/**
+ * @file awaitable.h
+ * @brief C++20 coroutine awaitable types for libezio
+ *
+ * This entire header is conditionally compiled on EZIO_ENABLE_COROUTINE.
+ * C++11 users of the library can safely #include it — the guards are a no-op.
+ */
+
+#include "../platform_define.h"
+
+#if EZIO_ENABLE_COROUTINE
+
 #include <coroutine>
 #include <functional>
 #include <cstdint>
@@ -27,6 +39,15 @@
 
 namespace ezio {
 namespace coroutine {
+
+// Forward declaration
+class coroutine_service;
+
+// Thread-local pointer to the current coroutine_service.
+// Set before spawning a coroutine so that promise_type::operator new
+// can allocate coroutine frames from the service's pre-allocated pool.
+// Defined in a .cpp file (coroutine_service.cpp or awaitable.cpp) to avoid ODR issues.
+extern thread_local coroutine_service* current_coro_svc;
 
 // ============================================================================
 // Callback-based awaiter base
@@ -215,6 +236,13 @@ class task;
 
 namespace detail {
 
+// Trampoline functions that delegate to coroutine_service::alloc_frame/free_frame.
+// Defined in coroutine_service.cpp to break the circular dependency:
+//   awaitable.h --forward-declares--> coroutine_service
+//   coroutine_service.h --includes--> awaitable.h
+void* frame_alloc(std::size_t sz);
+void  frame_free(void* ptr, std::size_t sz);
+
 struct task_promise_base {
     std::coroutine_handle<> continuation_{ nullptr };
     std::exception_ptr exception_{ nullptr };
@@ -228,6 +256,32 @@ struct task_promise_base {
     std::function<void()> on_final_resume_{ nullptr };
 
     std::suspend_always initial_suspend() noexcept { return {}; }
+
+    // ================================================================
+    // Coroutine frame allocation: from thread-local coroutine_service pool
+    // ================================================================
+
+    /**
+     * @brief Allocate coroutine frame from the current service's frame pool.
+     *
+     * If current_coro_svc is set, allocates from its pre-allocated pool
+     * (0 heap allocation). Otherwise falls back to global ::operator new.
+     */
+    //
+    // Coroutine frame allocation — from thread-local coroutine_service pool.
+    // Delegates to detail::frame_alloc/frame_free to avoid requiring the
+    // full coroutine_service definition at this point (circular dependency:
+    //   awaitable.h --fwd-decl--> coroutine_service
+    //   coroutine_service.h --includes--> awaitable.h
+    // )
+    //
+    static void* operator new(std::size_t sz) {
+        return detail::frame_alloc(sz);
+    }
+
+    static void operator delete(void* ptr, std::size_t sz) {
+        detail::frame_free(ptr, sz);
+    }
 
     struct final_awaiter {
         bool await_ready() noexcept { return false; }
@@ -393,3 +447,5 @@ private:
 
 } // namespace coroutine
 } // namespace ezio
+
+#endif // EZIO_ENABLE_COROUTINE

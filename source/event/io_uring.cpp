@@ -139,7 +139,9 @@ namespace ezio {
 #ifdef IORING_TIMEOUT_MULTISHOT
             auto sqe = get_io_uring_sqe();
             STABLE_INFRA_CHECK_SUC(sqe != nullptr, -1);
-            uint64_t user_data = 0;
+            // Cancel the multishot timeout SQE using the complete_action pointer
+            // as user_data (matching what submit_timeout uses).
+            uint64_t user_data = reinterpret_cast<uint64_t>(iter->second.get());
             ring_ptr_->prepare_cancel(sqe, (void*)user_data, 0);
             auto ret = ring_ptr_->submit();
             STABLE_INFRA_CHECK_SUC(ret > 0, -1);
@@ -271,10 +273,8 @@ namespace ezio {
             complete_action_ptr->set_callback(tmp_cb);
             auto cancel_sqe = get_io_uring_sqe();
             STABLE_INFRA_CHECK_SUC(cancel_sqe != nullptr, -1);
-            ring_ptr_->prepare_cancel(cancel_sqe, complete_action_ptr, 0);
+            ring_ptr_->prepare_cancel_by_fd(cancel_sqe, complete_action_ptr, fd.get_fd());
             auto ret = ring_ptr_->submit();
-            //io_uring_prep_cancel(cancel_sqe, complete_action_ptr, 0);
-            //auto ret = io_uring_submit(io_uring_ptr_.get());
             STABLE_INFRA_CHECK_SUC(ret > 0, -1);
             return 0;
         }
@@ -511,7 +511,7 @@ namespace ezio {
             complete_action_ptr->set_callback(tmp_cb);
             auto cancel_sqe = get_io_uring_sqe();
             STABLE_INFRA_CHECK_SUC(cancel_sqe != nullptr, -1);
-            ring_ptr_->prepare_cancel(cancel_sqe, complete_action_ptr, 0);
+            ring_ptr_->prepare_cancel_by_fd(cancel_sqe, complete_action_ptr, fd.get_fd());
             //io_uring_prep_cancel(cancel_sqe, complete_action_ptr, 0);
             //auto ret = io_uring_submit(io_uring_ptr_.get());
             auto ret = ring_ptr_->submit();

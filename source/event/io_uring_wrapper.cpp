@@ -246,7 +246,15 @@ namespace ezio {
                                               uint32_t flags)
         {
             PREPARE_SQE(sqe, IORING_OP_ASYNC_CANCEL, -1, user_data, 0, 0, 0);
-            sqe->cancel_flags = flags; // 将 flags 赋值给 cancel_flags 字段
+            sqe->cancel_flags = flags;
+        }
+
+        void io_uring_wrapper::prepare_cancel_by_fd(struct io_uring_sqe* sqe,
+                void* user_data, int32_t fd)
+        {
+            PREPARE_SQE(sqe, IORING_OP_ASYNC_CANCEL, fd, user_data, 0, 0, 0);
+            sqe->cancel_flags = IORING_ASYNC_CANCEL_FD | IORING_ASYNC_CANCEL_ANY;
+            sqe->len = IORING_OP_READ;
         }
 
         void io_uring_wrapper::prepare_recv_multishot(struct io_uring_sqe* sqe,

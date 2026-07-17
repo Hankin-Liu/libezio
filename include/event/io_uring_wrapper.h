@@ -110,6 +110,8 @@ namespace ezio {
                                  uint32_t count, uint32_t flags);
             void prepare_cancel(struct io_uring_sqe* sqe, void* user_data,
                     uint32_t flags);
+            void prepare_cancel_by_fd(struct io_uring_sqe* sqe, void* user_data,
+                    int32_t fd);
             void prepare_recv_multishot(struct io_uring_sqe* sqe,
                     int32_t fd, struct msghdr* msghdr_ptr,
                     uint32_t flags, uint16_t buf_group_id);

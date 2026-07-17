@@ -9,8 +9,11 @@
  * EZIO_ENABLE_COROUTINE == 1 (C++20 compiler with <coroutine>).
  *
  * Usage Pattern:
- *   int32_t bytes = co_await coro_svc.read(fd, &iov, 1);
- *   int32_t written = co_await coro_svc.write(fd, &iov, 1);
+ *   auto ar = cs.read(fd, &iov, 1);
+ *   int32_t bytes = co_await *ar;
+ *
+ * All async_* / awaitable objects are returned as std::unique_ptr to
+ * ensure the callback's captured "this" pointer remains valid after move.
  ***************************************************************************************/
 #pragma once
 
@@ -24,6 +27,7 @@
 #include <list>
 #include <vector>
 #include <atomic>
+#include "../data_struct/opt_map.h"
 
 // Default frame pool configuration
 static constexpr size_t DEFAULT_FRAME_BLOCK_SIZE = 8192;
@@ -31,53 +35,6 @@ static constexpr size_t DEFAULT_FRAME_POOL_CAPACITY = 4096;
 
 namespace ezio {
 namespace coroutine {
-
-// ============================================================================
-// async_accept_result: awaitable for accept callback
-//   callback = void(int32_t, const sock_info&)
-// ============================================================================
-
-/**
- * @brief Awaitable for async accept operations.
- * 
- * co_await returns int32_t (0 = success, negative = error).
- * Use result().sock_info_ to get the accepted fd.
- */
-class async_accept_result : public callback_awaiter_base {
-public:
-    struct accept_result {
-        int32_t ret_{ 0 };
-        event::sock_info sock_info_;
-    };
-
-    async_accept_result() = default;
-    async_accept_result(async_accept_result&&) = default;
-    async_accept_result& operator=(async_accept_result&&) = default;
-
-    int32_t await_resume() {
-        return result_.ret_;
-    }
-
-    void complete(int32_t ret, const event::sock_info& info) noexcept {
-        result_.ret_ = ret;
-        result_.sock_info_ = info;
-        do_resume();
-    }
-
-    std::function<void(int32_t, const event::sock_info&)> as_accept_callback() {
-        return [this](int32_t ret, const event::sock_info& info) {
-            this->complete(ret, info);
-        };
-    }
-
-    /// Access full result after co_await
-    const accept_result& result() const { return result_; }
-    int32_t ret() const { return result_.ret_; }
-    const event::sock_info& sock_info() const { return result_.sock_info_; }
-
-private:
-    accept_result result_;
-};
 
 // ============================================================================
 // coroutine_frame_pool — fixed-size block pool, 0 heap alloc after ctor
@@ -156,6 +113,25 @@ static_assert(DEFAULT_FRAME_BLOCK_SIZE >= 80,
 // coroutine_service
 // ============================================================================
 
+// ========================================================================
+// fd operation state: tracked by coroutine_service for concurrency control
+// ========================================================================
+
+enum class fd_read_state : uint8_t {
+    NONE,       // No read in progress
+    PENDING,    // Read submitted, read coroutine is suspended
+    CANCELLING  // Cancel has been submitted, waiting for CQE
+};
+
+struct fd_info {
+    fd_read_state state_{ fd_read_state::NONE };
+    async_read_result* pending_read_awaiter_{ nullptr };
+};
+using fd_info_ptr = std::shared_ptr<fd_info>;
+
+// Max number of tracked fds (must be larger than any fd that will be tracked)
+static constexpr uint32_t CORO_MAX_FD = 100000;
+
 class coroutine_service {
 public:
     explicit coroutine_service(event::event_service* svc,
@@ -163,6 +139,7 @@ public:
                                size_t frame_pool_capacity = DEFAULT_FRAME_POOL_CAPACITY)
         : svc_(svc)
         , frame_pool_(frame_block_size, frame_pool_capacity)
+        , fd_info_map_()
     {
         set_current();
     }
@@ -179,13 +156,8 @@ public:
     /// Called automatically in constructor; call manually if you
     /// re-enter a coroutine-creating context outside this service's
     /// lifetime (rare).
-    void set_current()  { current_coro_svc = this; }
-
-    /// Deactivate pool allocation: clears thread-local pointer so
-    /// that future coroutine frames use the global heap.
-    /// Called automatically in destructor; call manually only if
-    /// you temporarily need heap allocation (benchmarking).
-    void clear_current() { current_coro_svc = nullptr; }
+    void set_current();
+    void clear_current();
 
     /// Access the underlying event_service, e.g. for direct callback-based usage.
     event::event_service* get_event_service() const { return svc_; }
@@ -196,36 +168,102 @@ public:
 
     /**
      * @brief Submit an async read and suspend until completion.
-     * 
+     *
      * Usage:
      *   ::iovec iov{ buf, sizeof(buf) };
-     *   int32_t bytes = co_await coro_svc.read(fd, &iov, 1);
-     *   // bytes = bytes read, or negative errno
-     *   // Use ar.ret(), ar.iov(), ar.iov_cnt() for full result
+     *   auto ar = coro_svc.read(fd, &iov, 1);
+     *   int32_t bytes = co_await *ar;
      */
-    async_read_result read(const event::fd_t& fd,
-                           ::iovec* buffer, uint32_t buffer_iov_cnt,
-                           const event::read_options* opt = nullptr) {
-        async_read_result ar;
-        int32_t rc = svc_->submit_async_read(fd, buffer, buffer_iov_cnt,
-                                              ar.as_read_callback(), opt);
-        if (rc != 0) {
-            // Submit failed synchronously — complete immediately
-            ar.complete(rc, buffer, buffer_iov_cnt, nullptr);
+    auto read(const event::fd_t& fd,
+              ::iovec* buffer, uint32_t buffer_iov_cnt,
+              const event::read_options* opt = nullptr)
+        -> std::unique_ptr<async_read_result>
+    {
+        auto ar = std::make_unique<async_read_result>();
+
+        auto fd_key = static_cast<uint32_t>(fd.get_fd());
+        const auto& found_ref = fd_info_map_.find(fd_key);
+        fd_info_ptr info_ptr;
+        if (found_ref != nullptr) {
+            info_ptr = found_ref;
+        } else {
+            info_ptr = std::make_shared<fd_info>();
+            STABLE_INFRA_ASSERT(fd_info_map_.insert(fd_key, info_ptr));
         }
-        return ar;  // caller: co_await this
+
+        if (info_ptr->state_ != fd_read_state::NONE) {
+            ar->complete(-EALREADY, buffer, buffer_iov_cnt, nullptr);
+            return ar;
+        }
+
+        info_ptr->state_ = fd_read_state::PENDING;
+        info_ptr->pending_read_awaiter_ = ar.get();
+
+        auto ar_cb = ar->as_read_callback();
+        auto tmp_cb = [this, fd_key, ar_cb = std::move(ar_cb)](
+                int32_t ret, const ::iovec* iov, uint32_t iov_cnt, void* extra) mutable {
+            const auto& found_ref = fd_info_map_.find(fd_key);
+            if (found_ref != nullptr) {
+                found_ref->state_ = fd_read_state::NONE;
+                found_ref->pending_read_awaiter_ = nullptr;
+            }
+            ar_cb(ret, iov, iov_cnt, extra);
+        };
+
+        int32_t rc = svc_->submit_async_read(fd, buffer, buffer_iov_cnt,
+                                              tmp_cb, opt);
+        if (rc != 0) {
+            info_ptr->state_ = fd_read_state::NONE;
+            info_ptr->pending_read_awaiter_ = nullptr;
+            ar->complete(rc, buffer, buffer_iov_cnt, nullptr);
+        }
+        return ar;
     }
 
     /**
      * @brief Read using pre-registered buffer group (for buffer-ring mode)
      */
-    async_read_result read(const event::fd_t& fd, uint32_t buffer_group_id,
-                           const event::read_options* opt = nullptr) {
-        async_read_result ar;
+    auto read(const event::fd_t& fd, uint32_t buffer_group_id,
+              const event::read_options* opt = nullptr)
+        -> std::unique_ptr<async_read_result>
+    {
+        auto ar = std::make_unique<async_read_result>();
+
+        auto fd_key = static_cast<uint32_t>(fd.get_fd());
+        const auto& found_ref = fd_info_map_.find(fd_key);
+        fd_info_ptr info_ptr;
+        if (found_ref != nullptr) {
+            info_ptr = found_ref;
+        } else {
+            info_ptr = std::make_shared<fd_info>();
+            STABLE_INFRA_ASSERT(fd_info_map_.insert(fd_key, info_ptr));
+        }
+
+        if (info_ptr->state_ != fd_read_state::NONE) {
+            ar->complete(-EALREADY, nullptr, 0, nullptr);
+            return ar;
+        }
+
+        info_ptr->state_ = fd_read_state::PENDING;
+        info_ptr->pending_read_awaiter_ = ar.get();
+
+        auto ar_cb = ar->as_read_callback();
+        auto tmp_cb = [this, fd_key, ar_cb = std::move(ar_cb)](
+                int32_t ret, const ::iovec* iov, uint32_t iov_cnt, void* extra) mutable {
+            const auto& found_ref = fd_info_map_.find(fd_key);
+            if (found_ref != nullptr) {
+                found_ref->state_ = fd_read_state::NONE;
+                found_ref->pending_read_awaiter_ = nullptr;
+            }
+            ar_cb(ret, iov, iov_cnt, extra);
+        };
+
         int32_t rc = svc_->submit_async_read(fd, buffer_group_id,
-                                              ar.as_read_callback(), opt);
+                                              tmp_cb, opt);
         if (rc != 0) {
-            ar.complete(rc, nullptr, 0, nullptr);
+            info_ptr->state_ = fd_read_state::NONE;
+            info_ptr->pending_read_awaiter_ = nullptr;
+            ar->complete(rc, nullptr, 0, nullptr);
         }
         return ar;
     }
@@ -236,19 +274,22 @@ public:
 
     /**
      * @brief Submit an async write and suspend until completion.
-     * 
+     *
      * Usage:
      *   ::iovec iov{ data, len };
-     *   int32_t bytes = co_await coro_svc.write(fd, &iov, 1);
+     *   auto ar = coro_svc.write(fd, &iov, 1);
+     *   int32_t bytes = co_await *ar;
      */
-    async_result write(const event::fd_t& fd,
-                       ::iovec* buffer, uint32_t buffer_iov_cnt,
-                       const event::write_options* opt = nullptr) {
-        async_result ar;
+    auto write(const event::fd_t& fd,
+               ::iovec* buffer, uint32_t buffer_iov_cnt,
+               const event::write_options* opt = nullptr)
+        -> std::unique_ptr<async_result>
+    {
+        auto ar = std::make_unique<async_result>();
         int32_t rc = svc_->submit_async_write(fd, buffer, buffer_iov_cnt,
-                                               ar.as_callback(), opt);
+                                               ar->as_callback(), opt);
         if (rc != 0) {
-            ar.complete(rc);
+            ar->complete(rc);
         }
         return ar;
     }
@@ -259,20 +300,23 @@ public:
 
     /**
      * @brief Submit an async accept and suspend until completion.
-     * 
+     *
      * Usage:
      *   event::sock_info addr_buf;
-     *   int32_t ret = co_await coro_svc.accept(listen_fd, &addr_buf);
+     *   auto ar = coro_svc.accept(listen_fd, &addr_buf);
+     *   int32_t ret = co_await *ar;
      *   // ret = 0 on success, negative on error
-     *   // ar.sock_info().fd_ is the accepted client fd
+     *   // ar->sock_info().fd_ is the accepted client fd
      */
-    async_accept_result accept(const event::fd_t& listen_fd,
-                               event::sock_info* addr_buffer) {
-        async_accept_result ar;
+    auto accept(const event::fd_t& listen_fd,
+                event::sock_info* addr_buffer)
+        -> std::unique_ptr<async_accept_result>
+    {
+        auto ar = std::make_unique<async_accept_result>();
         int32_t rc = svc_->submit_async_accept(listen_fd, addr_buffer,
-                                                ar.as_accept_callback());
+                                                ar->as_accept_callback());
         if (rc != 0) {
-            ar.complete(rc, event::sock_info{});
+            ar->complete(rc, event::sock_info{});
         }
         return ar;
     }
@@ -281,29 +325,76 @@ public:
     // Async Cancel
     // ========================================================================
 
-    async_result cancel_read(const event::fd_t& fd) {
-        async_result ar;
-        int32_t rc = svc_->cancel_async_read(fd, ar.as_callback());
+    auto cancel_read(const event::fd_t& fd)
+        -> std::unique_ptr<async_result>
+    {
+        auto ar = std::make_unique<async_result>();
+
+        auto fd_key = static_cast<uint32_t>(fd.get_fd());
+        const auto& found_ref = fd_info_map_.find(fd_key);
+        if (found_ref == nullptr) {
+            ar->complete(-EALREADY);
+            return ar;
+        }
+
+        if (found_ref->state_ != fd_read_state::PENDING) {
+            ar->complete(-EALREADY);
+            return ar;
+        }
+
+        found_ref->state_ = fd_read_state::CANCELLING;
+
+        // Wake up the suspended read coroutine with -ECANCELED
+        if (found_ref->pending_read_awaiter_ != nullptr) {
+            found_ref->pending_read_awaiter_->complete(-ECANCELED, nullptr, 0, nullptr);
+            found_ref->pending_read_awaiter_ = nullptr;
+        }
+
+        // Guard: prevents the cancel CQE callback from completing `ar` after
+        // it has already been completed synchronously (when submit succeeds).
+        auto done_flag = std::make_shared<std::atomic<bool>>(false);
+
+        auto cancel_ar_cb = ar->as_callback();
+        auto guarded_cb = [this, fd_key, done_flag, cancel_ar_cb = std::move(cancel_ar_cb)](int32_t res) mutable {
+            if (done_flag->exchange(true)) return;  // already handled
+            const auto& found_ref = fd_info_map_.find(fd_key);
+            if (found_ref != nullptr) {
+                found_ref->state_ = fd_read_state::NONE;
+            }
+            cancel_ar_cb(res);
+        };
+
+        int32_t rc = svc_->cancel_async_read(fd, std::move(guarded_cb));
         if (rc != 0) {
-            ar.complete(rc);
+            found_ref->state_ = fd_read_state::NONE;
+            ar->complete(rc);
+        } else {
+            // Mark done BEFORE completing ar, so any race with CQE callback
+            // is resolved by the atomic guard.
+            done_flag->store(true);
+            ar->complete(0);
         }
         return ar;
     }
 
-    async_result cancel_write(const event::fd_t& fd) {
-        async_result ar;
-        int32_t rc = svc_->cancel_async_write(fd, ar.as_callback());
+    auto cancel_write(const event::fd_t& fd)
+        -> std::unique_ptr<async_result>
+    {
+        auto ar = std::make_unique<async_result>();
+        int32_t rc = svc_->cancel_async_write(fd, ar->as_callback());
         if (rc != 0) {
-            ar.complete(rc);
+            ar->complete(rc);
         }
         return ar;
     }
 
-    async_result cancel_accept(const event::fd_t& listen_fd) {
-        async_result ar;
-        int32_t rc = svc_->cancel_async_accept(listen_fd, ar.as_callback());
+    auto cancel_accept(const event::fd_t& listen_fd)
+        -> std::unique_ptr<async_result>
+    {
+        auto ar = std::make_unique<async_result>();
+        int32_t rc = svc_->cancel_async_accept(listen_fd, ar->as_callback());
         if (rc != 0) {
-            ar.complete(rc);
+            ar->complete(rc);
         }
         return ar;
     }
@@ -314,18 +405,32 @@ public:
 
     /**
      * @brief Create a timer and suspend until it fires.
-     * 
+     *
      * Usage:
-     *   int32_t timer_id = co_await coro_svc.sleep(1, 0);  // 1 second
-     *   // After resume, close the timer:
-     *   svc_->close_timer(timer_id);
+     *   auto ar = coro_svc.sleep(1, 0);
+     *   int32_t timer_id = co_await *ar;  // 1 second
+     *
+     * Note: create_timer expects callback signature void(uint64_t), while
+     * as_callback() returns void(int32_t).  We wrap it with a lambda that
+     * converts the argument and closes the timer afterwards.
      */
-    async_result sleep(uint64_t interval_s, uint64_t interval_ns) {
-        async_result ar;
-        int32_t rc = svc_->create_timer(interval_s, interval_ns,
-                                         ar.as_callback());
-        if (rc < 0) {
-            ar.complete(rc);
+    auto sleep(uint64_t interval_s, uint64_t interval_ns)
+        -> std::unique_ptr<async_timer_result>
+    {
+        auto ar = std::make_unique<async_timer_result>();
+        auto timer_id = std::make_shared<int32_t>(-1);
+        // as_timer_callback() already has the correct void(uint64_t) signature.
+        // Wrap to auto-close the timer after resume.
+        auto raw_cb = ar->as_timer_callback();
+        auto timer_cb = [svc = svc_, timer_id, raw_cb = std::move(raw_cb)](uint64_t count) mutable {
+            raw_cb(count);                          // resume coroutine
+            if (*timer_id >= 0) {
+                svc->close_timer(*timer_id);        // cleanup timer
+            }
+        };
+        *timer_id = svc_->create_timer(interval_s, interval_ns, std::move(timer_cb));
+        if (*timer_id < 0) {
+            ar->complete(static_cast<uint64_t>(*timer_id));
         }
         return ar;
     }
@@ -336,14 +441,16 @@ public:
 
     /**
      * @brief Run a job in the event loop and await its completion.
-     * 
+     *
      * Useful for thread-safe operations that must run in the event loop.
      */
-    async_result run_in_loop(const std::function<void(void)>& job) {
-        async_result ar;
-        svc_->run_job([&ar, job]() {
+    auto run_in_loop(const std::function<void(void)>& job)
+        -> std::unique_ptr<async_result>
+    {
+        auto ar = std::make_unique<async_result>();
+        svc_->run_job([ar_ptr = ar.get(), job]() {
             job();
-            ar.complete(0);
+            ar_ptr->complete(0);
         });
         return ar;
     }
@@ -357,17 +464,7 @@ public:
      *
      * The spawned task is automatically start()ed and tracked by this service.
      * On completion, the task's final_suspend callback pushes its
-     * std::list iterator into an internal dead-queue. Deferred cleanup is
-     * batched: only the first completion after a cleanup triggers a single
-     * evt loop job post; subsequent completions before cleanup runs only
-     * append to the pending queue. This avoids N posts for N completions.
-     *
-     * Safety: the on_final_resume_ callback only pushes an iterator into a
-     * vector — it never touches the coroutine frame itself. The frame stays
-     * alive because final_suspend returns suspend_always. The actual erase
-     * (which triggers task destructor and coroutine frame destruction) happens
-     * later in sweep_completed(), which is safe because by then the callback
-     * has already returned and the frame is fully quiescent.
+     * std::list iterator into an internal dead-queue.
      *
      * Usage:
      *   coro_svc.spawn(echo_loop(coro_svc, fd));
@@ -387,14 +484,10 @@ public:
         auto& promise = it->get_promise();
         promise.on_final_resume_ = [this, iter = it]() {
             pending_cleanup_.push_back(iter);
-            // Only the first completion after last drain triggers a post.
-            // All completions happen on the same evt loop thread, so
-            // a plain bool is sufficient — no atomics needed.
             if (!cleanup_posted_) {
                 cleanup_posted_ = true;
                 svc_->run_job([this]() {
                     this->sweep_completed();
-                    // All done — allow next batch
                     cleanup_posted_ = false;
                 });
             }
@@ -406,9 +499,6 @@ public:
 private:
     /**
      * @brief Drain pending queue and erase completed tasks from active list.
-     *
-     * Called from a evt loop job that was registered by the first
-     * completion after the last drain.
      */
     void sweep_completed() {
         for (auto& iter : pending_cleanup_) {
@@ -429,9 +519,6 @@ public:
 
     /**
      * @brief Number of currently active spawned tasks.
-     *
-     * Note: includes completed-but-not-yet-swept tasks.
-     * Use sweep() first for accurate count.
      */
     size_t spawned_count() const {
         return spawned_list_.size();
@@ -441,16 +528,6 @@ public:
     // Frame pool access for task_promise_base::operator new/delete
     // ========================================================================
 
-    /**
-     * @brief Allocate a coroutine frame from the pre-allocated pool.
-     *
-     * Called by task_promise_base::operator new. Falls back to ::operator new
-     * if the block is larger than the pool block size or the pool is full.
-     *
-     * Note: sz is checked against block_size_. If bigger, we use global alloc
-     * because the coroutine has unusually large local data. The pool stores
-     * size_t overflow_ flag in the block itself so free can route correctly.
-     */
     void* alloc_frame(std::size_t sz) {
         if (sz <= frame_pool_.block_size()) {
             void* p = frame_pool_.alloc();
@@ -458,13 +535,9 @@ public:
                 return p;
             }
         }
-        // Pool exhausted or oversized frame — fallback to global heap
         return ::operator new(sz);
     }
 
-    /**
-     * @brief Free a coroutine frame.
-     */
     void free_frame(void* ptr, std::size_t sz) {
         if (sz <= frame_pool_.block_size() && frame_pool_.owns(ptr)) {
             frame_pool_.free(ptr);
@@ -473,46 +546,18 @@ public:
         }
     }
 
-    // ========================================================================
-    // Underlying service access
-    // ========================================================================
-
     event::event_service* get_service() const { return svc_; }
 
 private:
     event::event_service* svc_{ nullptr };
     coroutine_frame_pool frame_pool_;
+    ezio::data_struct::opt_map<fd_info_ptr, uint32_t, CORO_MAX_FD> fd_info_map_;
     std::list<task<void>> spawned_list_;
     std::vector<std::list<task<void>>::iterator> pending_cleanup_;
     bool cleanup_posted_{ false };
 };
 
-// ============================================================================
-// Example usage
-// ============================================================================
-//
-// ezio::coroutine::task<void> handle_connection(
-//     ezio::coroutine::coroutine_service& coro_svc,
-//     ezio::event::fd_t client_fd)
-// {
-//     char buf[4096];
-//     ::iovec iov{ buf, sizeof(buf) };
-//
-//     int32_t nread = co_await coro_svc.read(client_fd, &iov, 1);
-//     if (nread <= 0) { client_fd.close(); co_return; }
-//
-//     ::iovec w_iov{ buf, (size_t)nread };
-//     int32_t nwritten = co_await coro_svc.write(client_fd, &w_iov, 1);
-//
-//     client_fd.close();
-//     co_return;
-// }
-//
-// void start_connection(ezio::coroutine::coroutine_service& svc,
-//                        ezio::event::fd_t fd) {
-//     auto t = handle_connection(svc, fd);
-//     t.start();
-// }
+extern thread_local coroutine_service* current_coro_svc;
 
 } // namespace coroutine
 } // namespace ezio

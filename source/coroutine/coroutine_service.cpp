@@ -27,6 +27,18 @@ namespace coroutine {
 thread_local coroutine_service* current_coro_svc = nullptr;
 
 // ========================================================================
+// set_current / clear_current
+// ========================================================================
+
+void coroutine_service::set_current() {
+    current_coro_svc = this;
+}
+
+void coroutine_service::clear_current() {
+    current_coro_svc = nullptr;
+}
+
+// ========================================================================
 // Frame alloc/free trampolines (break circular dependency in awaitable.h)
 // ========================================================================
 

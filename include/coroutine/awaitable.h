@@ -10,206 +10,272 @@
  * promise_type construction). The coroutine frame is the promise;
  * we use co_await to suspend and a callback to resume.
  *
- * @author Generated
- * @license ...
+ * All mutable state is stored in a heap-allocated block (state) inside
+ * each awaitable type. Callbacks capture a raw pointer to this state
+ * block, which survives move operations (unique_ptr). The owning
+ * awaitable object can be moved freely; the state block stays at the
+ * same heap address until the last owner is destroyed.
  ***************************************************************************************/
-#pragma once
 
-/**
- * @file awaitable.h
- * @brief C++20 coroutine awaitable types for libezio
- *
- * This entire header is conditionally compiled on EZIO_ENABLE_COROUTINE.
- * C++11 users of the library can safely #include it — the guards are a no-op.
- */
+#ifndef EZIO_AWAITABLE_H
+#define EZIO_AWAITABLE_H
 
-#include "../platform_define.h"
-
-#if EZIO_ENABLE_COROUTINE
+#if __cplusplus >= 202002L && EZIO_ENABLE_COROUTINE
 
 #include <coroutine>
 #include <functional>
 #include <cstdint>
-#include <optional>
-#include <exception>
-#include <system_error>
-#include <atomic>
-#include <type_traits>
-#include <sys/uio.h>
+#include <memory>
 
-namespace ezio {
-namespace coroutine {
+#include "type_def.h"
+#include "util/util.h"
 
-// Forward declaration
-class coroutine_service;
-
-// Thread-local pointer to the current coroutine_service.
-// Set before spawning a coroutine so that promise_type::operator new
-// can allocate coroutine frames from the service's pre-allocated pool.
-// Defined in a .cpp file (coroutine_service.cpp or awaitable.cpp) to avoid ODR issues.
-extern thread_local coroutine_service* current_coro_svc;
+namespace ezio::coroutine {
 
 // ============================================================================
-// Callback-based awaiter base
+// callback_awaiter_base: common state holder for callback-driven awaitables
 // ============================================================================
 
 /**
- * @brief Base class for callbacks that bridge to coroutines.
- * 
- * Uses a simple approach: the awaitable itself holds a flag and a 
- * coroutine_handle. When co_awaited, the caller is stored; the callback
- * (registered with libezio) sets the flag and resumes the caller.
+ * @brief Base class holding the coroutine handle.
+ *
+ * All mutable state is in a heap-allocated block.  Callbacks capture a raw
+ * pointer to this block (self_), which is stable across moves of the owning
+ * unique_ptr/object.
  */
 class callback_awaiter_base {
 public:
+    struct state {
+        std::coroutine_handle<> handle_{ nullptr };
+    };
+
     callback_awaiter_base() = default;
 
-    // Move-only
     callback_awaiter_base(const callback_awaiter_base&) = delete;
     callback_awaiter_base& operator=(const callback_awaiter_base&) = delete;
     callback_awaiter_base(callback_awaiter_base&& other) noexcept
-        : handle_(other.handle_) {
-        other.handle_ = nullptr;
+        : self_(other.self_) {
+        other.self_ = nullptr;
     }
     callback_awaiter_base& operator=(callback_awaiter_base&& other) noexcept {
         if (this != &other) {
-            handle_ = other.handle_;
-            other.handle_ = nullptr;
+            delete self_;
+            self_ = other.self_;
+            other.self_ = nullptr;
         }
         return *this;
     }
 
+    ~callback_awaiter_base() = default;
+
     bool await_ready() const noexcept { return false; }
 
     void await_suspend(std::coroutine_handle<> caller) noexcept {
-        handle_ = caller;
+        self_->handle_ = caller;
     }
 
 protected:
-    /// Called by the libezio callback to wake the waiter.
-    /// Must be callable from any thread (libezio event loop thread).
     void do_resume() noexcept {
-        if (handle_) {
-            handle_.resume();
+        if (self_ && self_->handle_) {
+            self_->handle_.resume();
         }
     }
 
-    std::coroutine_handle<> handle_{ nullptr };
+    state* self_{ nullptr };
 };
 
 // ============================================================================
 // async_result: awaitable for a callback that returns int32_t
 // ============================================================================
 
-/**
- * @brief Awaitable for a single callback that returns int32_t.
- * 
- * Usage:
- *   async_result ar;
- *   svc->submit_async_write(fd, buf, cnt, ar.as_callback());
- *   int32_t ret = co_await ar;
- */
 class async_result : public callback_awaiter_base {
 public:
-    async_result() = default;
+    /// Extended state block with result and optional cleanup
+    struct async_state : state {
+        bool ready_{ false };
+        int32_t result_{ 0 };
+        std::function<void(int32_t)> cleanup_{ nullptr };
+    };
+
+    async_result() {
+        self_ = new async_state();
+    }
+    ~async_result() {
+        delete static_cast<async_state*>(self_);
+    }
     async_result(async_result&&) = default;
     async_result& operator=(async_result&&) = default;
 
+    /// If complete() was already called before co_await, don't suspend.
+    bool await_ready() const noexcept {
+        auto* s = static_cast<async_state*>(self_);
+        return s->ready_;
+    }
+
     int32_t await_resume() {
-        return result_;
+        auto* s = static_cast<async_state*>(self_);
+        return s->result_;
     }
 
-    /// Called by libezio callback to complete and resume
+    /// Called by libezio callback (via lambda capturing self_) to complete and resume
     void complete(int32_t ret) noexcept {
-        result_ = ret;
-        do_resume();
+        auto* s = static_cast<async_state*>(self_);
+        s->ready_ = true;
+        s->result_ = ret;
+        if (s->cleanup_) {
+            s->cleanup_(ret);
+        }
+        if (s->handle_) {
+            s->handle_.resume();
+        }
     }
 
-    /// Convert to a std::function<void(int32_t)> for libezio callback
+    /// Convert to a std::function<void(int32_t)> for libezio callback.
+    /// Captures only the pointer to the heap state block – stable across moves.
     std::function<void(int32_t)> as_callback() {
-        return [this](int32_t ret) {
-            this->complete(ret);
+        auto* s = static_cast<async_state*>(self_);
+        return [s](int32_t ret) mutable {
+            s->ready_ = true;
+            s->result_ = ret;
+            auto cb = std::move(s->cleanup_);
+            if (cb) {
+                cb(ret);
+            }
+            s->cleanup_ = std::move(cb);
+            if (s->handle_) {
+                s->handle_.resume();
+            }
         };
     }
 
-private:
-    int32_t result_{ 0 };
+    /// Register a cleanup callback to be called right before resume.
+    /// Receives the result code so the callback can act on it.
+    void on_complete(std::function<void(int32_t)> cb) {
+        auto* s = static_cast<async_state*>(self_);
+        s->cleanup_ = std::move(cb);
+    }
 };
 
 // ============================================================================
 // async_read_result: awaitable for read callback
-//   callback = void(int32_t, const ::iovec*, uint32_t, void*)
+//   callback signature: void(int32_t, const ::iovec*, uint32_t, void*)
 // ============================================================================
 
 class async_read_result : public callback_awaiter_base {
 public:
     struct read_result {
-        int32_t ret_{ 0 };              ///< bytes read (or negative errno)
-        const ::iovec* iov_{ nullptr }; ///< updated iov after partial read
-        uint32_t iov_cnt_{ 0 };         ///< remaining iov count
-        void* extra_{ nullptr };        ///< extra data (sockaddr etc.)
+        int32_t ret_{ 0 };
+        const ::iovec* iov_{ nullptr };
+        uint32_t iov_cnt_{ 0 };
+        void* extra_{ nullptr };
     };
 
-    async_read_result() = default;
+    /// Extended state block with read result
+    struct async_read_state : state {
+        read_result result_;
+    };
+
+    async_read_result() {
+        self_ = new async_read_state();
+    }
+    ~async_read_result() {
+        delete static_cast<async_read_state*>(self_);
+    }
     async_read_result(async_read_result&&) = default;
     async_read_result& operator=(async_read_result&&) = default;
 
-    /// @brief await_resume returns the result code (bytes read or negative errno).
-    ///        Use ret()/iov()/iov_cnt()/extra() to access full result.
     int32_t await_resume() {
-        return result_.ret_;
+        auto* s = static_cast<async_read_state*>(self_);
+        return s->result_.ret_;
     }
 
     void complete(int32_t ret, const ::iovec* iov, uint32_t iov_cnt, void* extra) noexcept {
-        result_.ret_ = ret;
-        result_.iov_ = iov;
-        result_.iov_cnt_ = iov_cnt;
-        result_.extra_ = extra;
+        auto* s = static_cast<async_read_state*>(self_);
+        s->result_.ret_ = ret;
+        s->result_.iov_ = iov;
+        s->result_.iov_cnt_ = iov_cnt;
+        s->result_.extra_ = extra;
         do_resume();
     }
 
-    /// Convert to libezio read callback signature
+    /// Convert to libezio read callback signature.
+    /// Captures only the heap state pointer – stable across moves.
     std::function<void(int32_t, const ::iovec*, uint32_t, void*)> as_read_callback() {
-        return [this](int32_t ret, const ::iovec* iov, uint32_t iov_cnt, void* extra) {
-            this->complete(ret, iov, iov_cnt, extra);
+        auto* s = static_cast<async_read_state*>(self_);
+        return [s](int32_t ret, const ::iovec* iov, uint32_t iov_cnt, void* extra) mutable {
+            s->result_.ret_ = ret;
+            s->result_.iov_ = iov;
+            s->result_.iov_cnt_ = iov_cnt;
+            s->result_.extra_ = extra;
+            if (s->handle_) {
+                s->handle_.resume();
+            }
         };
     }
 
     /// Access full result after co_await
-    const read_result& result() const { return result_; }
-    /// Convenience: bytes read (same as co_await return value)
-    int32_t ret() const { return result_.ret_; }
-    const ::iovec* iov() const { return result_.iov_; }
-    uint32_t iov_cnt() const { return result_.iov_cnt_; }
-    void* extra() const { return result_.extra_; }
-
-private:
-    read_result result_;
+    const read_result& result() const {
+        auto* s = static_cast<async_read_state*>(self_);
+        return s->result_;
+    }
+    int32_t ret() const {
+        auto* s = static_cast<async_read_state*>(self_);
+        return s->result_.ret_;
+    }
+    const ::iovec* iov() const {
+        auto* s = static_cast<async_read_state*>(self_);
+        return s->result_.iov_;
+    }
+    uint32_t iov_cnt() const {
+        auto* s = static_cast<async_read_state*>(self_);
+        return s->result_.iov_cnt_;
+    }
+    void* extra() const {
+        auto* s = static_cast<async_read_state*>(self_);
+        return s->result_.extra_;
+    }
 };
 
 // ============================================================================
 // async_timer_result: awaitable for timer callback
-//   callback = void(uint64_t)
+//   callback signature: void(uint64_t)
 // ============================================================================
 
 class async_timer_result : public callback_awaiter_base {
 public:
-    async_timer_result() = default;
+    /// Extended state block with timer expiration count
+    struct async_timer_state : state {
+        uint64_t expiration_count_{ 0 };
+    };
+
+    async_timer_result() {
+        self_ = new async_timer_state();
+    }
+    ~async_timer_result() {
+        delete static_cast<async_timer_state*>(self_);
+    }
     async_timer_result(async_timer_result&&) = default;
     async_timer_result& operator=(async_timer_result&&) = default;
 
     uint64_t await_resume() {
-        return expiration_count_;
+        auto* s = static_cast<async_timer_state*>(self_);
+        return s->expiration_count_;
     }
 
     void complete(uint64_t count) noexcept {
-        expiration_count_ = count;
+        auto* s = static_cast<async_timer_state*>(self_);
+        s->expiration_count_ = count;
         do_resume();
     }
 
+    /// Convert to timer callback. Captures only the heap state pointer.
     std::function<void(uint64_t)> as_timer_callback() {
-        return [this](uint64_t count) {
-            this->complete(count);
+        auto* s = static_cast<async_timer_state*>(self_);
+        return [s](uint64_t count) mutable {
+            s->expiration_count_ = count;
+            if (s->handle_) {
+                s->handle_.resume();
+            }
         };
     }
 
@@ -218,19 +284,68 @@ private:
 };
 
 // ============================================================================
+// async_accept_result: awaitable for accept callback
+//   callback signature: void(int32_t, const event::sock_info&)
+// ============================================================================
+
+class async_accept_result : public callback_awaiter_base {
+public:
+    struct accept_result {
+        int32_t fd_{ -1 };
+        event::sock_info info_;
+    };
+
+    /// Extended state block with accept result
+    struct async_accept_state : state {
+        accept_result result_;
+    };
+
+    async_accept_result() {
+        self_ = new async_accept_state();
+    }
+    ~async_accept_result() {
+        delete static_cast<async_accept_state*>(self_);
+    }
+    async_accept_result(async_accept_result&&) = default;
+    async_accept_result& operator=(async_accept_result&&) = default;
+
+    int32_t await_resume() {
+        auto* s = static_cast<async_accept_state*>(self_);
+        return s->result_.fd_;
+    }
+
+    void complete(int32_t fd, const event::sock_info& info) noexcept {
+        auto* s = static_cast<async_accept_state*>(self_);
+        s->result_.fd_ = fd;
+        s->result_.info_ = info;
+        do_resume();
+    }
+
+    /// Convert to accept callback. Captures only the heap state pointer.
+    std::function<void(int32_t, const event::sock_info&)> as_accept_callback() {
+        auto* s = static_cast<async_accept_state*>(self_);
+        return [s](int32_t fd, const event::sock_info& info) mutable {
+            s->result_.fd_ = fd;
+            s->result_.info_ = info;
+            if (s->handle_) {
+                s->handle_.resume();
+            }
+        };
+    }
+
+    const accept_result& result() const {
+        auto* s = static_cast<async_accept_state*>(self_);
+        return s->result_;
+    }
+
+private:
+    accept_result result_;
+};
+
+// ============================================================================
 // task<T> – awaitable coroutine return type
 // ============================================================================
 
-/**
- * @brief A simple task type for composing coroutines.
- * 
- * Allows:
- *   task<int> foo() { co_return 42; }
- *   task<int> bar() {
- *     int v = co_await foo();
- *     co_return v + 1;
- *   }
- */
 template<typename T>
 class task;
 
@@ -247,101 +362,73 @@ struct task_promise_base {
     std::coroutine_handle<> continuation_{ nullptr };
     std::exception_ptr exception_{ nullptr };
 
+    // Allocate coroutine frame from the pool if current_coro_svc is set
+    static void* operator new(std::size_t sz) {
+        return frame_alloc(sz);
+    }
+
+    static void operator delete(void* ptr, std::size_t sz) {
+        frame_free(ptr, sz);
+    }
+
     /// Optional: called in final_suspend before resuming continuation.
     /// Used by coroutine_service::spawn to auto-enqueue this task's
     /// iterator into a dead-queue for lazy cleanup.
-    /// Safe to call here: the coroutine frame is still alive (we return
-    /// suspend_always and the compiler does not destroy it until the
-    /// task destructor calls handle_.destroy()).
     std::function<void()> on_final_resume_{ nullptr };
 
     std::suspend_always initial_suspend() noexcept { return {}; }
 
-    // ================================================================
-    // Coroutine frame allocation: from thread-local coroutine_service pool
-    // ================================================================
-
-    /**
-     * @brief Allocate coroutine frame from the current service's frame pool.
-     *
-     * If current_coro_svc is set, allocates from its pre-allocated pool
-     * (0 heap allocation). Otherwise falls back to global ::operator new.
-     */
-    //
-    // Coroutine frame allocation — from thread-local coroutine_service pool.
-    // Delegates to detail::frame_alloc/frame_free to avoid requiring the
-    // full coroutine_service definition at this point (circular dependency:
-    //   awaitable.h --fwd-decl--> coroutine_service
-    //   coroutine_service.h --includes--> awaitable.h
-    // )
-    //
-    static void* operator new(std::size_t sz) {
-        return detail::frame_alloc(sz);
-    }
-
-    static void operator delete(void* ptr, std::size_t sz) {
-        detail::frame_free(ptr, sz);
-    }
-
     struct final_awaiter {
-        bool await_ready() noexcept { return false; }
+        constexpr bool await_ready() noexcept { return false; }
 
-        template<typename Promise>
-        void await_suspend(std::coroutine_handle<Promise> h) noexcept {
-            // Resume continuation first (if any).
-            // Then fire the cleanup callback as the very last thing.
-            // Order matters: the callback may have side effects that
-            // assume the continuation has already been notified.
-            auto& promise = h.promise();
-            auto continuation = promise.continuation_;
-            auto cleanup = std::move(promise.on_final_resume_);
-
-            if (continuation) {
-                continuation.resume();
+        template<typename PromiseT>
+        void await_suspend(std::coroutine_handle<PromiseT> h) noexcept {
+            auto base = std::coroutine_handle<task_promise_base>::from_address(h.address());
+            auto& promise = base.promise();
+            if (promise.on_final_resume_) {
+                promise.on_final_resume_();
             }
-            // Now callback truly is the last thing that touches this frame.
-            // After this returns, the coroutine is fully quiescent.
-            if (cleanup) {
-                cleanup();
+            auto cont = promise.continuation_;
+            if (cont) {
+                cont.resume();
             }
         }
 
-        void await_resume() noexcept {}
+        constexpr void await_resume() noexcept {}
     };
 
-    final_awaiter final_suspend() noexcept { return {}; }
+    auto final_suspend() noexcept {
+        return final_awaiter{};
+    }
+
     void unhandled_exception() noexcept {
         exception_ = std::current_exception();
     }
+
+    bool done() const noexcept { return false; }
 };
 
 } // namespace detail
 
 template<typename T>
-class task {
+class [[nodiscard]] task {
 public:
     struct promise_type : detail::task_promise_base {
         T value_;
 
-        task get_return_object() noexcept {
-            return task{ std::coroutine_handle<promise_type>::from_promise(*this) };
+        task<T> get_return_object() noexcept {
+            return task<T>(std::coroutine_handle<promise_type>::from_promise(*this));
         }
 
-        template<typename U>
-        void return_value(U&& val) noexcept(std::is_nothrow_constructible_v<T, U>) {
-            value_ = std::forward<U>(val);
+        void return_value(T v) noexcept {
+            value_ = std::move(v);
         }
     };
 
-    using handle_type = std::coroutine_handle<promise_type>;
+    using handle_t = std::coroutine_handle<promise_type>;
 
-    explicit task(handle_type h) : handle_(h) {}
-
-    task(const task&) = delete;
-    task& operator=(const task&) = delete;
-    task(task&& other) noexcept : handle_(other.handle_) {
-        other.handle_ = nullptr;
-    }
+    explicit task(handle_t h) : handle_(h) {}
+    task(task&& other) noexcept : handle_(other.handle_) { other.handle_ = nullptr; }
     task& operator=(task&& other) noexcept {
         if (this != &other) {
             if (handle_) handle_.destroy();
@@ -350,60 +437,50 @@ public:
         }
         return *this;
     }
-    ~task() {
-        if (handle_) handle_.destroy();
-    }
-
-    bool await_ready() const noexcept { return false; }
+    ~task() { if (handle_) handle_.destroy(); }
 
     T await_resume() {
-        if (handle_.promise().exception_) {
-            std::rethrow_exception(handle_.promise().exception_);
-        }
+        if (handle_.promise().exception_) std::rethrow_exception(handle_.promise().exception_);
         return std::move(handle_.promise().value_);
     }
 
+    bool await_ready() noexcept { return false; }
     void await_suspend(std::coroutine_handle<> caller) noexcept {
         handle_.promise().continuation_ = caller;
     }
 
-    void start() {
+    bool done() const noexcept {
+        return !handle_ || handle_.done();
+    }
+
+    promise_type& get_promise() noexcept {
+        return handle_.promise();
+    }
+
+    void start() noexcept {
         if (handle_ && !handle_.done()) {
             handle_.resume();
         }
     }
 
-    bool done() const {
-        return !handle_ || handle_.done();
-    }
-
-    /// Access the promise (for coroutine_service internal use)
-    promise_type& get_promise() { return handle_.promise(); }
-
-private:
-    handle_type handle_{ nullptr };
+    handle_t handle_;
 };
 
+/// Specialization for void return
 template<>
-class task<void> {
+class [[nodiscard]] task<void> {
 public:
     struct promise_type : detail::task_promise_base {
-        task get_return_object() noexcept {
-            return task{ std::coroutine_handle<promise_type>::from_promise(*this) };
+        task<void> get_return_object() noexcept {
+            return task<void>(std::coroutine_handle<promise_type>::from_promise(*this));
         }
-
         void return_void() noexcept {}
     };
 
-    using handle_type = std::coroutine_handle<promise_type>;
+    using handle_t = std::coroutine_handle<promise_type>;
 
-    explicit task(handle_type h) : handle_(h) {}
-
-    task(const task&) = delete;
-    task& operator=(const task&) = delete;
-    task(task&& other) noexcept : handle_(other.handle_) {
-        other.handle_ = nullptr;
-    }
+    explicit task(handle_t h) : handle_(h) {}
+    task(task&& other) noexcept : handle_(other.handle_) { other.handle_ = nullptr; }
     task& operator=(task&& other) noexcept {
         if (this != &other) {
             if (handle_) handle_.destroy();
@@ -412,40 +489,86 @@ public:
         }
         return *this;
     }
-    ~task() {
-        if (handle_) handle_.destroy();
-    }
-
-    bool await_ready() const noexcept { return false; }
+    ~task() { if (handle_) handle_.destroy(); }
 
     void await_resume() {
-        if (handle_.promise().exception_) {
-            std::rethrow_exception(handle_.promise().exception_);
-        }
+        if (handle_.promise().exception_) std::rethrow_exception(handle_.promise().exception_);
     }
 
+    bool await_ready() noexcept { return false; }
     void await_suspend(std::coroutine_handle<> caller) noexcept {
         handle_.promise().continuation_ = caller;
     }
 
-    void start() {
+    bool done() const noexcept {
+        return !handle_ || handle_.done();
+    }
+
+    promise_type& get_promise() noexcept {
+        return handle_.promise();
+    }
+
+    void start() noexcept {
         if (handle_ && !handle_.done()) {
             handle_.resume();
         }
     }
 
-    bool done() const {
-        return !handle_ || handle_.done();
-    }
-
-    /// Access the promise (for coroutine_service internal use)
-    promise_type& get_promise() { return handle_.promise(); }
-
-private:
-    handle_type handle_{ nullptr };
+    handle_t handle_;
 };
 
-} // namespace coroutine
-} // namespace ezio
+// ============================================================================
+// generator<T>: minimal async generator (suspend on yield, resume on next)
+// ============================================================================
 
-#endif // EZIO_ENABLE_COROUTINE
+template<typename T>
+class generator {
+public:
+    struct promise_type {
+        T current_value_;
+
+        generator<T> get_return_object() noexcept {
+            return generator<T>(std::coroutine_handle<promise_type>::from_promise(*this));
+        }
+
+        std::suspend_always initial_suspend() noexcept { return {}; }
+        std::suspend_always final_suspend() noexcept { return {}; }
+        std::suspend_always yield_value(T v) noexcept {
+            current_value_ = std::move(v);
+            return {};
+        }
+        void return_void() noexcept {}
+        void unhandled_exception() noexcept { std::terminate(); }
+    };
+
+    using handle_t = std::coroutine_handle<promise_type>;
+
+    explicit generator(handle_t h) : handle_(h) {}
+    generator(generator&& other) noexcept : handle_(other.handle_) { other.handle_ = nullptr; }
+    generator& operator=(generator&& other) noexcept {
+        if (this != &other) {
+            if (handle_) handle_.destroy();
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+    ~generator() { if (handle_) handle_.destroy(); }
+
+    bool next() {
+        if (!handle_) return false;
+        handle_.resume();
+        return !handle_.done();
+    }
+
+    const T& value() const { return handle_.promise().current_value_; }
+
+private:
+    handle_t handle_;
+};
+
+} // namespace ezio::coroutine
+
+#endif // __cplusplus >= 202002L && EZIO_ENABLE_COROUTINE
+
+#endif // EZIO_AWAITABLE_H

@@ -38,7 +38,6 @@ int main(int argc, char** argv) {
     cout << "# Directory  : coroutine" << endl;
     cout << "# CASE       : 1" << endl;
     cout << "# RESULT     : " << (done.load() ? "PASS" : "FAILED") << endl;
-    cout << "# DESCRIPTION: co_await sleep(1s)." << endl;
     cout << "#####################################################" << endl;
 
     fflush(stdout);

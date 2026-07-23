@@ -64,5 +64,5 @@ if [[ $PASS_CNT -eq 1 ]]; then
 else
     echo "# RESULT     : FAILED"
 fi
-echo "# DESCRIPTION: co_await sleep(1s) and sleep(1ms). Verify task completion."
+echo "# DESCRIPTION: cs.sleep(1s,0) and cs.sleep(1ms,0) co_await. Verifies both timers fire and both coroutines resume via counter=2."
 echo "#####################################################"

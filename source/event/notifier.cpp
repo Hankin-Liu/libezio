@@ -224,5 +224,12 @@ namespace ezio {
             // call user registered function
             notify_handler_();
         }
+
+        notify_callback_t notifier::exchange_callback(const notify_callback_t& new_cb)
+        {
+            auto old = std::move(notify_handler_);
+            notify_handler_ = std::move(new_cb);
+            return old;
+        }
     }
 }

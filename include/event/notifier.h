@@ -57,9 +57,13 @@ namespace ezio {
                 virtual void handle_loop_once() override;
 
                 // same thread callable
-                //inline void set_weight_thredhold(uint32_t threshold) {
-                //    shared_data_ptr_->threshold_to_raise_priority_ = threshold;
-                //}
+                /**
+                 * @brief Atomically replace notify_handler_ with new_cb and
+                 *        return the previous value.
+                 *
+                 * Must be called from the event loop thread.
+                 */
+                notify_callback_t exchange_callback(const notify_callback_t& new_cb);
                 // thread safe
                 int32_t close();
             protected:

@@ -284,6 +284,69 @@ private:
 };
 
 // ============================================================================
+// async_void_result: awaitable for a callback that returns void
+//   callback signature: void(void)
+//   Used by inotify watch_file, notifier, and any other void(void) callback.
+// ============================================================================
+
+class async_void_result : public callback_awaiter_base {
+public:
+    struct async_void_state : state {
+        bool ready_{ false };
+        std::shared_ptr<void> guard_{ nullptr };
+        std::function<void(void)> saved_cb_{ nullptr };
+    };
+
+    async_void_result() {
+        self_ = new async_void_state();
+    }
+    ~async_void_result() {
+        auto* s = static_cast<async_void_state*>(self_);
+        (void)s;
+    }
+    async_void_result(async_void_result&&) = default;
+    async_void_result& operator=(async_void_result&&) = default;
+
+    bool await_ready() const noexcept {
+        auto* s = static_cast<async_void_state*>(self_);
+        return s->ready_;
+    }
+
+    void await_resume() noexcept {}
+
+    void complete() noexcept {
+        auto* s = static_cast<async_void_state*>(self_);
+        s->ready_ = true;
+        do_resume();
+    }
+
+    void set_guard(std::shared_ptr<void> g) noexcept {
+        auto* s = static_cast<async_void_state*>(self_);
+        s->guard_ = std::move(g);
+    }
+
+    void set_saved_cb(std::function<void(void)> cb) noexcept {
+        auto* s = static_cast<async_void_state*>(self_);
+        s->saved_cb_ = std::move(cb);
+    }
+
+    std::function<void(void)> take_saved_cb() noexcept {
+        auto* s = static_cast<async_void_state*>(self_);
+        return std::move(s->saved_cb_);
+    }
+
+    std::function<void(void)> as_void_callback() {
+        auto* s = static_cast<async_void_state*>(self_);
+        return [s]() mutable {
+            s->ready_ = true;
+            if (s->handle_) {
+                s->handle_.resume();
+            }
+        };
+    }
+};
+
+// ============================================================================
 // async_accept_result: awaitable for accept callback
 //   callback signature: void(int32_t, const event::sock_info&)
 // ============================================================================
@@ -444,9 +507,13 @@ public:
         return std::move(handle_.promise().value_);
     }
 
-    bool await_ready() noexcept { return false; }
-    void await_suspend(std::coroutine_handle<> caller) noexcept {
+    bool await_ready() noexcept { return !handle_ || handle_.done(); }
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<> caller) noexcept {
         handle_.promise().continuation_ = caller;
+        if (!handle_.done()) {
+            return handle_;
+        }
+        return std::noop_coroutine();
     }
 
     bool done() const noexcept {
@@ -461,6 +528,14 @@ public:
         if (handle_ && !handle_.done()) {
             handle_.resume();
         }
+    }
+
+    /// Reset handle to nullptr without destroying.
+    /// Used by coroutine_service::spawn to prevent double-destroy
+    /// (the coroutine frame is already freed by promise_type::operator delete
+    /// when the coroutine completes).
+    void clear_handle() noexcept {
+        handle_ = nullptr;
     }
 
     handle_t handle_;
@@ -495,9 +570,13 @@ public:
         if (handle_.promise().exception_) std::rethrow_exception(handle_.promise().exception_);
     }
 
-    bool await_ready() noexcept { return false; }
-    void await_suspend(std::coroutine_handle<> caller) noexcept {
+    bool await_ready() noexcept { return !handle_ || handle_.done(); }
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<> caller) noexcept {
         handle_.promise().continuation_ = caller;
+        if (!handle_.done()) {
+            return handle_;
+        }
+        return std::noop_coroutine();
     }
 
     bool done() const noexcept {
@@ -513,6 +592,15 @@ public:
             handle_.resume();
         }
     }
+
+    /// Reset handle to nullptr without destroying.
+    /// Used by coroutine_service::spawn to prevent double-destroy.
+    void clear_handle() noexcept {
+        handle_ = nullptr;
+    }
+
+    /// Expose raw handle for coroutine_service::spawn internal use.
+    handle_t get_handle() const noexcept { return handle_; }
 
     handle_t handle_;
 };

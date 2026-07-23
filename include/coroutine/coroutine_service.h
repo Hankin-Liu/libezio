@@ -145,6 +145,7 @@ public:
     }
 
     ~coroutine_service() {
+        clear_spawned();
         clear_current();
     }
 
@@ -481,8 +482,17 @@ public:
 
         // Register final_suspend callback: push iterator to pending queue
         // and lazily schedule a single cleanup job on the evt loop.
+        //
+        // IMPORTANT: The coroutine frame is automatically freed by
+        // promise_type::operator delete when the coroutine completes.
+        // Clear the task's handle_ here so ~task() will NOT call
+        // handle_.destroy() again (double-free).
         auto& promise = it->get_promise();
         promise.on_final_resume_ = [this, iter = it]() {
+            // Clear handle first to prevent double-free in ~task()
+            // (compiler-generated code calls operator delete after
+            //  final_suspend returns, freeing the coroutine frame).
+            iter->clear_handle();
             pending_cleanup_.push_back(iter);
             if (!cleanup_posted_) {
                 cleanup_posted_ = true;

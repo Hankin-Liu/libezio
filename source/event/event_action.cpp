@@ -104,7 +104,7 @@ namespace ezio {
                 }
                 STABLE_INFRA_ASSERT(non_submit_write_task_.empty());
             }
-            if (multishot_read_task_ == nullptr) {
+            if (multishot_read_task_ != nullptr) {
                 multishot_read_task_->is_submit_ = true;
             }
         }
